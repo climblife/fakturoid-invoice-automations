@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Inbox → Expense workflow for Fakturoid (ClimbLife).
 
-Two subcommands:
-  fetch             download the first file from the Krabice (Inbox Files)
-  create --data F   create a fully-filled, paid Expense from F (JSON), then
-                    delete the original inbox file
+Subcommands:
+  list              list all files in the Krabice (inbox) with metadata
+  fetch             download the first file from the Krabice (convenience)
+  download --id N   download a specific inbox file by id into tmp/
+  create --data F   create a fully-filled, paid Expense from F (JSON), attach
+                    one or more inbox files to it, then delete those files
+                    from the Krabice
 """
 
 from __future__ import annotations
@@ -76,30 +79,33 @@ def get_slug(token: str) -> str:
     return accounts[0]["slug"]
 
 
-def cmd_fetch(args: argparse.Namespace) -> None:
-    token = get_token()
-    slug = get_slug(token)
+def list_inbox_files(token: str, slug: str) -> list:
+    out = []
+    page = 1
+    while True:
+        r = requests.get(
+            f"{API_BASE}/accounts/{slug}/inbox_files.json",
+            headers=auth_headers(token),
+            params={"page": page},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            die(f"Inbox list failed: {r.status_code} {r.text}")
+        batch = r.json()
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 40:
+            break
+        page += 1
+        if page > 20:
+            break
+    return out
 
-    r = requests.get(
-        f"{API_BASE}/accounts/{slug}/inbox_files.json",
-        headers=auth_headers(token),
-        params={"page": 1},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        die(f"Inbox list failed: {r.status_code} {r.text}")
-    files = r.json()
-    if not files:
-        print(json.dumps({"empty": True, "slug": slug}))
-        return
 
-    f = files[0]
-    inbox_id = f["id"]
-    filename = f["filename"]
-
+def download_inbox_file(token: str, slug: str, inbox_id: int, filename: str) -> Path:
     TMP_DIR.mkdir(exist_ok=True)
     local_path = TMP_DIR / f"{inbox_id}__{filename}"
-
     dl = requests.get(
         f"{API_BASE}/accounts/{slug}/inbox_files/{inbox_id}/download",
         headers=auth_headers(token),
@@ -108,14 +114,64 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if dl.status_code != 200:
         die(f"Download failed: {dl.status_code} {dl.text}")
     local_path.write_bytes(dl.content)
+    return local_path
 
+
+def cmd_list(args: argparse.Namespace) -> None:
+    token = get_token()
+    slug = get_slug(token)
+    files = list_inbox_files(token, slug)
     print(json.dumps({
         "slug": slug,
-        "inbox_id": inbox_id,
-        "filename": filename,
+        "count": len(files),
+        "files": [
+            {
+                "inbox_id": f["id"],
+                "filename": f["filename"],
+                "bytes": f.get("bytesize"),
+                "ocr_status": f.get("ocr_status"),
+                "created_at": f.get("created_at"),
+            }
+            for f in files
+        ],
+    }, ensure_ascii=False, indent=2))
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    token = get_token()
+    slug = get_slug(token)
+    files = list_inbox_files(token, slug)
+    if not files:
+        print(json.dumps({"empty": True, "slug": slug}))
+        return
+
+    f = files[0]
+    local_path = download_inbox_file(token, slug, f["id"], f["filename"])
+    print(json.dumps({
+        "slug": slug,
+        "inbox_id": f["id"],
+        "filename": f["filename"],
         "local_path": str(local_path),
-        "bytes": len(dl.content),
+        "bytes": local_path.stat().st_size,
         "ocr_status": f.get("ocr_status"),
+    }, ensure_ascii=False, indent=2))
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    token = get_token()
+    slug = get_slug(token)
+    files = list_inbox_files(token, slug)
+    match = next((f for f in files if f["id"] == args.id), None)
+    if not match:
+        die(f"Inbox file id={args.id} not found in Krabice")
+    local_path = download_inbox_file(token, slug, match["id"], match["filename"])
+    print(json.dumps({
+        "slug": slug,
+        "inbox_id": match["id"],
+        "filename": match["filename"],
+        "local_path": str(local_path),
+        "bytes": local_path.stat().st_size,
+        "ocr_status": match.get("ocr_status"),
     }, ensure_ascii=False, indent=2))
 
 
@@ -212,16 +268,36 @@ def build_attachment(local_path: Path) -> dict:
     }
 
 
-def create_expense(token: str, slug: str, data: dict, subject_id: int) -> dict:
-    local_path = Path(data["local_path"])
+def normalize_attachments(data: dict) -> list[dict]:
+    """Return list of {inbox_id, local_path} dicts.
+
+    Supports legacy single-file shape ({inbox_id, local_path}) and new
+    multi-file shape ({attachments: [{inbox_id, local_path}, ...]}).
+    Order is preserved — first attachment is considered primary (Invoice
+    preferred over Receipt per accountant's preference).
+    """
+    if data.get("attachments"):
+        items = data["attachments"]
+    else:
+        items = [{"inbox_id": data["inbox_id"], "local_path": data["local_path"]}]
+    out = []
+    for it in items:
+        if not it.get("inbox_id") or not it.get("local_path"):
+            die(f"attachment missing inbox_id/local_path: {it}")
+        out.append({"inbox_id": int(it["inbox_id"]), "local_path": it["local_path"]})
+    return out
+
+
+def create_expense(token: str, slug: str, data: dict, subject_id: int, attachments: list[dict]) -> dict:
+    inbox_ids = ", ".join(str(a["inbox_id"]) for a in attachments)
     payload = {
         "subject_id": subject_id,
         "document_type": data.get("document_type", "invoice"),
         "lines": data["lines"],
-        "attachments": [build_attachment(local_path)],
+        "attachments": [build_attachment(Path(a["local_path"])) for a in attachments],
         "private_note": (
             "Vytvořeno pomocí Claude AI. "
-            f"Automaticky z Krabice (inbox_file_id={data['inbox_id']})."
+            f"Automaticky z Krabice (inbox_file_ids={inbox_ids})."
         ),
     }
     for key in (
@@ -269,19 +345,21 @@ def cmd_create(args: argparse.Namespace) -> None:
     with open(args.data, "r", encoding="utf-8") as fh:
         data = json.load(fh)
 
-    for required in ("inbox_id", "local_path", "supplier", "issued_on", "lines"):
+    for required in ("supplier", "issued_on", "lines"):
         if not data.get(required):
             die(f"data.json missing required field: {required}")
 
+    attachments = normalize_attachments(data)
     paid_on = data.get("paid_on") or data["issued_on"]
 
     token = get_token()
     slug = get_slug(token)
 
     subject_id, subject_created = find_or_create_subject(token, slug, data["supplier"])
-    expense = create_expense(token, slug, data, subject_id)
+    expense = create_expense(token, slug, data, subject_id, attachments)
     payment = pay_expense(token, slug, expense["id"], paid_on)
-    delete_inbox_file(token, slug, data["inbox_id"])
+    for a in attachments:
+        delete_inbox_file(token, slug, a["inbox_id"])
 
     print(json.dumps({
         "slug": slug,
@@ -292,6 +370,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         "expense_html_url": expense.get("html_url"),
         "paid_on": paid_on,
         "payment_id": payment.get("id"),
+        "attached_inbox_ids": [a["inbox_id"] for a in attachments],
         "inbox_deleted": True,
     }, ensure_ascii=False, indent=2))
 
@@ -300,7 +379,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("list", help="List all files in Krabice").set_defaults(func=cmd_list)
     sub.add_parser("fetch", help="Download first file from Krabice").set_defaults(func=cmd_fetch)
+
+    dp = sub.add_parser("download", help="Download a specific inbox file by id")
+    dp.add_argument("--id", type=int, required=True, help="Inbox file id")
+    dp.set_defaults(func=cmd_download)
 
     cp = sub.add_parser("create", help="Create expense from data.json")
     cp.add_argument("--data", required=True, help="Path to data.json")

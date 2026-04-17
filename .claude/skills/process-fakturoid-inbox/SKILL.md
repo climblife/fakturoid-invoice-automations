@@ -1,91 +1,95 @@
 ---
 name: process-fakturoid-inbox
-description: Zpracuje celou Krabici na náklady ve Fakturoidu (Inbox Files) pro projekt ClimbLife. Postupně pro každý soubor: stáhne ho, agent (Claude) z něj multimodálně přečte údaje, rozhodne, zda jde o duplicitu existujícího nákladu, a buď vytvoří nový zaplacený náklad, nebo jen smaže duplicitu z Krabice. Použij když uživatel požádá o zpracování Krabice, Inboxu, nákladů z Fakturoidu, nebo řekne věci jako "projdi krabici", "zpracuj inbox", "vytěž faktury", "udělej náklady z krabice".
+description: Zpracuje celou Krabici na náklady ve Fakturoidu (Inbox Files) pro projekt ClimbLife. Vylistuje všechny soubory, stáhne je, spáruje dvojice Receipt+Invoice a z každé dvojice (nebo samostatného souboru) vytvoří jeden kompletní zaplacený náklad se všemi přílohami. Použij když uživatel požádá o zpracování Krabice, Inboxu, nákladů z Fakturoidu, nebo řekne věci jako "projdi krabici", "zpracuj inbox", "vytěž faktury", "udělej náklady z krabice".
 ---
 
 # Zpracování celé Krabice na náklady ve Fakturoidu
 
-Tento skill projde všechny soubory v Krabici (Fakturoid Inbox Files) a z každého udělá kompletní zaplacený náklad. Opakuje fetch → read → rozhodnutí → create/delete, dokud je Krabice prázdná.
+Tento skill projde všechny soubory v Krabici (Fakturoid Inbox Files), spáruje dvojice **Receipt + Invoice**, které se vážou ke stejnému nákladu, a z každé skupiny vytvoří jeden kompletní zaplacený náklad **se všemi přílohami**.
 
 ## Předpoklady
 
 - Pracuješ v adresáři `/Users/michal/projects/climblife/invoicing`.
-- Existuje `.venv/` a `inbox_to_expense.py` s podporou subcommandů `fetch` a `create`.
+- Existuje `.venv/` a `inbox_to_expense.py` s podporou subcommandů `list`, `fetch`, `download`, `create`.
 - `.env` obsahuje `FAKTUROID_CLIENT_ID` a `FAKTUROID_CLIENT_SECRET`.
-- Pravidla z `CLAUDE.md` v rootu projektu platí (duplicity, paid_on=issued_on, "Vytvořeno pomocí Claude AI" do private_note).
+- Pravidla z `CLAUDE.md` v rootu projektu platí.
 
 Pokud cokoli z toho chybí, zastav se a zeptej uživatele.
 
-## Hlavní smyčka
+## Workflow
 
-Opakuj, dokud `fetch` nevrátí `{"empty": true}`:
-
-### 1. Stáhni další soubor
+### 1. Vylistuj Krabici
 
 ```bash
-.venv/bin/python inbox_to_expense.py fetch
+.venv/bin/python inbox_to_expense.py list
 ```
 
-Výstup je JSON. Pokud `empty: true` → Krabice je hotová, skonči a vypiš souhrn.
+Výstup: `{slug, count, files: [{inbox_id, filename, bytes, ocr_status, created_at}, ...]}`.
 
-Jinak máš `inbox_id`, `filename`, `local_path`.
+Pokud `count == 0` → hotovo, vypiš souhrn a skonči.
 
-### 2. Přečti soubor
+### 2. Stáhni všechny soubory
 
-Použij `Read` s absolutní cestou (`/Users/michal/projects/climblife/invoicing/` + `local_path`). Multimodálně (PDF/JPG/PNG) z dokladu extrahuj:
-
-- **supplier**: název, IČO (`registration_no`), DIČ (`vat_no`) — pokud jsou
-- **original_number**: číslo dokladu od dodavatele
-- **variable_symbol**: VS (často rovno `original_number` nebo z QR kódu)
-- **issued_on**: datum vystavení (YYYY-MM-DD)
-- **received_on**: obvykle = `issued_on`, pokud není jinde uvedeno
-- **due_on**: datum splatnosti
-- **taxable_fulfillment_due**: datum zdanitelného plnění (pokud faktura neobsahuje, použij `issued_on`)
-- **currency**: CZK / EUR / USD / …
-- **payment_method**: obvykle `card` (výchozí pro ClimbLife); `bank` u převodu
-- **vat_price_mode**: `without_vat` u dokladu bez DPH nebo s reverse charge; `from_total_with_vat` u dokladu, kde máš jen celkové částky s DPH; `without_vat` když máš jasný rozpis base + VAT
-- **lines**: co nejvěrněji z dokladu (name, quantity, unit_price, vat_rate); u jednoduchých dokladů stačí jeden řádek s celkovou sumou
-
-### 3. Zkontroluj, jestli to není duplicita
-
-**Toto je kritický krok.** V Krabici se občas objeví dva soubory k jednomu nákladu (typicky Receipt + Invoice od stejného dodavatele).
-
-Zavolej pomocný skript (nebo inline Python přes `.venv/bin/python`) a najdi expenses s:
-
-- stejným dodavatelem (subject match podle IČO nebo normalizovaného jména) **a**
-- stejným `original_number` (primární kritérium)
-- NEBO stejnou částkou + blízkým datem (± 5 dní), pokud `original_number` chybí
-
-Endpoint: `GET /accounts/climblife/expenses.json?subject_id=...&number=...` (parametry: `subject_id`, `number`, `since`, `until`). Alternativně vylistovat posledních pár nákladů daného subjectu a porovnat lokálně.
-
-**Pokud duplicita nalezena:**
-- Vypiš `"Duplicita nalezena (expense_id=..., number=...), jen mažu z Krabice"`.
-- Zavolej `DELETE /accounts/climblife/inbox_files/{inbox_id}.json` (např. inline přes curl / requests).
-- Pokračuj další iterací (zpět na krok 1).
-- **Nevolej `create`**.
-
-### 4. Sestav `data.json` a vytvoř náklad
-
-Pokud duplicita nenalezena, zapiš `data.json` s extrahovanými údaji (viz schéma níže) a zavolej:
+Pro každý `inbox_id` z listu zavolej:
 
 ```bash
-.venv/bin/python inbox_to_expense.py create --data data.json
+.venv/bin/python inbox_to_expense.py download --id <inbox_id>
 ```
 
-Skript udělá: find-or-create subject → create expense (s přílohou + `"Vytvořeno pomocí Claude AI."` v private_note) → payment (paid_on = issued_on, mark_document_as_paid) → DELETE inbox file.
+Získáš `local_path` pro každý.
 
-Výstup obsahuje `expense_id`, `expense_html_url`, `subject_created`. Zaznamenej pro závěrečný souhrn.
+### 3. Přečti každý soubor
 
-### 5. Opakuj
+Pro každý stažený soubor použij `Read` s absolutní cestou. Multimodálně (PDF/JPG/PNG) z dokladu extrahuj:
 
-Zpět na krok 1, dokud `fetch` nevrátí prázdnou Krabici.
+- **supplier**: název, IČO (`registration_no`), DIČ (`vat_no`)
+- **original_number**: číslo dokladu od dodavatele (**klíčové pro párování!**)
+- **variable_symbol**: VS
+- **issued_on / received_on / due_on / taxable_fulfillment_due** (YYYY-MM-DD)
+- **currency** (CZK / EUR / USD / …)
+- **payment_method**: obvykle `card`
+- **vat_price_mode**: `without_vat` u reverse charge / bez DPH; `from_total_with_vat` když máš jen celkové částky s DPH
+- **lines**: řádky dokladu
+- **document_kind**: identifikuj, jestli jde o "invoice" / "receipt" / jiné (z názvu souboru, nadpisu PDF — typicky "Invoice" vs. "Receipt" / "Payment Receipt")
+- **total**: celková částka (pro záložní párování, když chybí `original_number`)
 
-## Schéma `data.json`
+### 4. Spáruj dvojice
+
+Seskup soubory do skupin, kde sdílejí stejný "náklad". Kritéria:
+
+- **Primární:** stejný normalizovaný `supplier.name` **a** stejný `original_number`.
+- **Záložní** (když `original_number` chybí nebo se liší mezi Receipt a Invoice): stejný `supplier.name` + stejná `total` částka + stejné datum (± 2 dny).
+
+Typický pattern u ClimbLife: Expo má páry `Receipt-XXXX.pdf` + `Invoice-XXXX.pdf` se stejným `original_number`. Anthropic podobně. DigitalOcean také má někdy zvlášť Invoice a Payment Receipt (receipt má vlastní ID, invoice má svoje — párují se podle stejného data + částky + dodavatele).
+
+Výstupem této fáze je seznam **skupin**, každá obsahuje 1 nebo 2+ souborů.
+
+### 5. Pro každou skupinu zkontroluj, že už expense neexistuje
+
+Zavolej inline přes `.venv/bin/python`:
+
+- `GET /accounts/climblife/expenses.json?subject_id=<id>` a prohlédni `original_number` / částku / datum nejbližších nákladů.
+- Pokud se v účtu už **náklad** s těmito parametry vyskytuje, **nevytvářej duplikát**. Místo toho:
+  - vypiš `"Náklad už existuje (expense_id=..., number=...), přílohy v Krabici mažu"`,
+  - zavolej `DELETE /accounts/climblife/inbox_files/{id}.json` pro všechny soubory ve skupině,
+  - pokračuj další skupinou.
+
+### 6. Pro každou novou skupinu sestav `data.json` a zavolej `create`
+
+**Preferuj Invoice nad Receipt** při extrakci hodnot: pokud skupina obsahuje oba typy, naplňuj `supplier`, `original_number`, `lines`, čísla apod. z **Invoice**. Receipt slouží primárně jako doklad o platbě.
+
+Seřaď `attachments` tak, aby **Invoice byl první** (primární), Receipt druhý. Účetní pak v UI uvidí Invoice jako hlavní dokument.
+
+Pokud skupina obsahuje jen jeden soubor, použij ho přímo.
+
+Schéma `data.json` (rozšířené o `attachments[]`):
 
 ```json
 {
-  "inbox_id": 123,
-  "local_path": "tmp/123__invoice.pdf",
+  "attachments": [
+    {"inbox_id": 123, "local_path": "tmp/123__Invoice-XXX.pdf"},
+    {"inbox_id": 124, "local_path": "tmp/124__Receipt-XXX.pdf"}
+  ],
   "supplier": {
     "name": "Dodavatel s.r.o.",
     "registration_no": "12345678",
@@ -109,13 +113,24 @@ Zpět na krok 1, dokud `fetch` nevrátí prázdnou Krabici.
 
 `paid_on` neuváděj — skript ho odvodí jako `issued_on`.
 
+Zavolej:
+
+```bash
+.venv/bin/python inbox_to_expense.py create --data data.json
+```
+
+Skript vytvoří subject (pokud chybí), expense se všemi přílohami, platbu (`paid_on = issued_on`, `mark_document_as_paid`), a **smaže všechny připojené soubory z Krabice**.
+
+### 7. Iteruj přes všechny skupiny a zapiš souhrn
+
 ## Bezpečnostní pravidla
 
-- **Nikdy nemaž soubor z Krabice dříve, než je jisté, že buď (a) byl úspěšně vytvořen expense, nebo (b) jde prokazatelně o duplicitu.** Skript `create` to řeší, pro duplicity to musíš hlídat ručně (pořadí: ověř duplicitu → smaž).
-- Pokud `create` selže (nenulový exit code), zastav smyčku a nahlaš uživateli — soubor je pořád v Krabici, dá se opravit a spustit znovu.
-- Pokud nejsi schopen spolehlivě extrahovat klíčový údaj (dodavatel, datum, částka), zastav se a ukaž uživateli, co vidíš — ať rozhodne.
-- Maximum iterací v jedné smyčce: 50 (ochrana před nekonečným během). Pokud je Krabice větší, uživatel to ví a spustí znovu.
+- **Nikdy nemaž soubor z Krabice dříve, než je jisté, že byl buď (a) úspěšně připojen k novému nákladu, nebo (b) patří k již existujícímu nákladu.** Skript `create` to řeší — smaže jen po úspěšném vytvoření expense + platby.
+- Pokud `create` selže (nenulový exit code), zastav skupinu a nahlaš uživateli. Soubory zůstanou v Krabici.
+- Pokud nejsi schopen spolehlivě extrahovat klíčový údaj (dodavatel, datum, částka), nebo si nejsi jistý párováním, zastav se a ukaž uživateli, co vidíš — ať rozhodne.
+- Pokud ve skupině něco nesedí (např. dvě "Invoice" se stejným číslem, nebo Receipt s jinou částkou než Invoice), radši se zastav a zeptej, než vytvářet chybný náklad.
+- Maximum skupin v jedné dávce: 50.
 
 ## Závěrečný souhrn
 
-Na konci vypiš stručnou tabulku: filename → akce (created expense X / duplicate of Y / error), a celkové počty. Pokud bylo něco vytvořeno, odkaž HTML URL.
+Na konci vypiš stručnou tabulku: skupina → dodavatel → akce (created expense X s N přílohami / existing expense Y / error), a celkové počty. Pro vytvořené náklady odkaž HTML URL.

@@ -26,26 +26,27 @@ Aktuálně projekt umí zpracovat **Krabici na náklady** (Inbox Files): ze soub
 
 V Claude Code v tomto adresáři řekni něco jako „zpracuj krabici" / „projdi inbox" — aktivuje se skill `process-fakturoid-inbox` (`.claude/skills/process-fakturoid-inbox/SKILL.md`), který v cyklu stahuje soubory, čte je, detekuje duplicity (Receipt + Invoice ke stejnému nákladu) a vytváří náklady. Skill se zastaví, když je Krabice prázdná.
 
-### Varianta B — ruční běh jednoho souboru
+### Varianta B — ruční běh
 
 ```bash
-# 1. Stáhne první soubor z Krabice do tmp/ a vypíše JSON s metadaty
+# Vylistuj vše v Krabici
+.venv/bin/python inbox_to_expense.py list
+
+# Stáhni konkrétní soubor (nebo první přes `fetch`)
+.venv/bin/python inbox_to_expense.py download --id 835046
 .venv/bin/python inbox_to_expense.py fetch
 
-# 2. Podívej se na stažený PDF/obrázek a ručně vyplň data.json podle schématu
-#    (viz .claude/skills/process-fakturoid-inbox/SKILL.md)
-
-# 3. Vytvoří subject (pokud chybí), náklad s přílohou, platbu a smaže soubor z Krabice
+# Vyplň data.json podle schématu a vytvoř náklad
 .venv/bin/python inbox_to_expense.py create --data data.json
 ```
 
-`inbox_to_expense.py create` dělá tyto kroky atomicky s safety netem — pokud se vytváření nákladu nepovede, soubor zůstane v Krabici.
+`create` podporuje jeden soubor i pole `attachments: [{inbox_id, local_path}, ...]` pro dvojice Receipt + Invoice — první v pořadí je primární (preferuj Invoice). Po úspěšném vytvoření expense + platby skript smaže všechny uvedené soubory z Krabice. Při chybě soubory v Krabici zůstanou.
 
 ## Pravidla chování
 
 Popsaná v `CLAUDE.md`. Stručně:
 
-- **Duplicity v Krabici** (Receipt + Invoice ke stejnému nákladu): před vytvořením nákladu zkontrolovat, jestli už existuje expense se stejným `supplier` + `original_number`. Pokud ano, duplicitní soubor jen smazat z Krabice, žádný nový náklad nevytvářet.
+- **Dvojice Receipt + Invoice**: když v Krabici jsou oba soubory ke stejnému nákladu, vytvoří se **jeden náklad** s **oběma** soubory jako přílohy — Invoice první. Pokud už náklad se stejným dodavatelem + `original_number` v účtu existuje, nové soubory se z Krabice jen smažou.
 - **Datum platby** = datum vystavení (faktury ClimbLife jdou automaticky kartou).
 - **OCR**: dělá si ho Claude sám (multimodální čtení souboru). Fakturoid OCR přes API stejně dostupný není.
 - V `private_note` každého vytvořeného nákladu je `"Vytvořeno pomocí Claude AI."` + odkaz na zdrojový `inbox_file_id`.

@@ -1,14 +1,16 @@
 # ClimbLife Invoicing — poznámky pro Claude
 
-## Duplicity v Krabici na náklady
+## Dvojice Receipt + Invoice v Krabici
 
-V Krabici (Fakturoid Inbox Files) se občas objeví **dva soubory k jednomu nákladu** — typicky **Receipt** (účtenka / platební potvrzení) a **Invoice** (faktura) od stejného dodavatele za stejné plnění.
+V Krabici (Fakturoid Inbox Files) se často objeví **dva soubory k jednomu nákladu** — typicky **Receipt** (účtenka / platební potvrzení) a **Invoice** (faktura) od stejného dodavatele za stejné plnění.
 
-**Pravidlo:** V takovém případě **nevytvářet duplicitní náklad**. Když se narazí na soubor, který se váže k již existujícímu nákladu, **jen smazat ten duplicitní záznam z Krabice** (bez vytvoření nového expense).
+**Pravidlo:** V takovém případě vytvořit **jeden náklad** a **připojit k němu oba soubory** jako přílohy. Preferovat **Invoice** — data z něj mají přednost při vyplňování nákladu a v seřazení příloh je Invoice první (účetní ho má radši jako primární dokument).
 
-**Jak to poznat před vytvořením nákladu:** zkontrolovat, jestli už neexistuje expense se stejným `supplier` + `original_number`. Pokud číslo na dokladu chybí, porovnat podle kombinace dodavatel + částka + datum (± pár dní). Signály duplicity: stejný dodavatel, stejná částka, stejné/blízké datum, případně jiný typ přílohy (PDF vs obrázek, "receipt" vs "invoice" v názvu souboru).
+**Jak je spárovat:** soubory patří k sobě, když mají stejného `supplier` a stejný `original_number`. Pokud čísla chybí nebo se liší (DigitalOcean: Invoice a Payment Receipt mají každý vlastní ID), porovnat podle kombinace dodavatel + částka + datum (± pár dní). Signály páru: stejný dodavatel, stejná částka, stejné/blízké datum, dvojice "Receipt-XXX" + "Invoice-XXX" v názvech souborů.
 
-**Akce při nalezení duplicity:** `DELETE /accounts/{slug}/inbox_files/{id}.json` a skončit. Žádné POST /expenses.
+**Když už náklad existuje** (např. byl vytvořen dřív a Krabice dostala jen další doklad k němu): **nevytvářet nový expense**, jen **smazat soubory z Krabice** — `DELETE /accounts/{slug}/inbox_files/{id}.json`. Žádné další POST /expenses.
+
+**Skript `inbox_to_expense.py create`** umí pole `attachments: [{inbox_id, local_path}, ...]` — první v pořadí bude přiložený jako primární. Po úspěšném vytvoření nákladu smaže všechny uvedené soubory z Krabice.
 
 ## Ostatní pravidla pro vytváření nákladů z Krabice
 
