@@ -23,8 +23,11 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+load_dotenv()
+
 API_BASE = "https://app.fakturoid.cz/api/v3"
-USER_AGENT = "ClimbLife Invoicing (m.majsky@gmail.com)"
+# Contact for the Fakturoid User-Agent is set via env (.env), not hardcoded.
+USER_AGENT = os.environ.get("FAKTUROID_USER_AGENT", "ClimbLife Invoicing")
 TMP_DIR = Path("tmp")
 
 
